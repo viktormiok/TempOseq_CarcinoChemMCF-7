@@ -1,0 +1,1377 @@
+
+```{r }
+---
+title: Silent Spring - Gene expression analysis of chemically treated MCF-7 cells
+  in estrogen-starved and estrogen-treated conditions
+output:
+  html_document:
+    highlight: tango
+    theme: journal
+    toc: yes
+  pdf_document:
+    toc: yes
+date: "10/31/2017"
+---
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, fig.align="center")
+```
+
+## Verify or edit before runtime
+Change the working directory to wherever you are keeping the expression files.
+```{r}
+setwd("/Users/viktorian/Documents/SilentSpring/SilentSpring Data")
+```
+
+## Loading packages
+Required packages for downstream analysis
+```{r libraries, message=FALSE, warning=FALSE}
+library('plyr')
+library('DESeq2')
+library('ggplot2')
+library('pheatmap')
+library('RColorBrewer')
+library('UpSetR')
+library('tidyverse')
+library('data.table')
+library('reshape2')
+library('stringr')
+library('dplyr')
+library('gplots')
+library('mygene')
+library('gridExtra')
+library('gdata')
+```
+
+## Import condition table
+We decided to merge ```chemical``` and ```concentration``` variables into a single ```chem_dose``` variable that would later be used for GLM fitting.
+```{r}
+colData_raw <- read.csv("Condition_table_detailed.csv",
+                         header=TRUE
+)
+##assign row names, reorder
+row.names(colData_raw) = colData_raw$well_ID
+colData = colData_raw
+colData = colData[order(rownames(colData)),] 
+names(colData) = c("well_ID", "lane", "chemical", "concentration", 
+                   "estrogen", "biological_replicate", "plate_assignment",
+                   "technical_replicate", "plate")
+
+colData$well_ID = NULL
+colData$lane = NULL
+colData$plate_assignment = NULL
+colData$technical_rep = NULL
+colData$estrogen[colData["estrogen"] == 0] = "starved"
+colData$estrogen[colData["estrogen"] == 1] = "stimulated"
+colData$mega_var <- factor(paste0(colData$chemical, "_", colData$concentration, "_", colData$estrogen, "_", colData$plate))
+colData$chem_dose <- factor(paste0(colData$chemical, "_", colData$concentration))
+factor_cols = c("chemical", "estrogen", "biological_replicate", "plate","mega_var", "chem_dose")
+colData[factor_cols] <- lapply(colData[factor_cols], 
+                               as.factor
+)
+colData$chemical <- relevel(colData$chemical, 
+                            ref="control"
+)
+colData$estrogen <- relevel(colData$estrogen,
+                            ref="starved"
+)
+colData$chem_dose <- relevel(colData$chem_dose,
+                             ref="control_0"
+)
+```
+
+
+## Import count data
+
+```{r}
+
+# adjust countData matrix by extracting just S1 column names
+rownames = rownames(colData)
+
+###import biospyder files
+###Plate 1
+PL1A_raw <- read.csv("PL1A.csv", 
+                     header=TRUE
+)
+PL1B_raw <- read.csv("PL1B.csv",
+                     header=TRUE
+)
+PL1C_raw <- read.csv("PL1C.csv",
+                     header=TRUE
+)
+PL1D_raw <- read.csv("PL1D.csv",
+                     header=TRUE
+)
+###Plate 2
+PL2A_raw <- read.csv("PL2A.csv",
+                     header=TRUE
+)
+PL2B_raw <- read.csv("PL2B.csv",
+                     header=TRUE
+)
+PL2C_raw <- read.csv("PL2C.csv",
+                     header=TRUE
+)
+PL2D_raw <- read.csv("PL2D.csv",
+                     header=TRUE
+)
+###Plate 3
+PL3A_raw <- read.csv("PL3A.csv", 
+                     header=TRUE
+)
+PL3B_raw <- read.csv("PL3B.csv",
+                     header=TRUE
+)
+PL3C_raw <- read.csv("PL3C.csv",
+                     header=TRUE
+)
+PL3D_raw <- read.csv("PL3D.csv", 
+                     header=TRUE
+)
+
+###combine plates into one table
+plates_all <- join_all(list(PL1A_raw,PL1B_raw,PL1C_raw,PL1D_raw,
+                            PL2A_raw,PL2B_raw,PL2C_raw,PL2D_raw,
+                            PL3A_raw,PL3B_raw,PL3C_raw,PL3D_raw),
+                       by="Gene",
+                       type="full"
+)
+###assign row and column names for count data, and put in alphabetical order and round
+row.names(plates_all) = plates_all$Gene
+plates_all = plates_all[order(plates_all$Gene), ]
+
+### Turn count dataframe into a matrix
+countData_matrix = as.matrix(plates_all[, 2:(length(plates_all))])
+rownames(countData_matrix) = plates_all$Gene
+```
+
+## Initial QC
+A boxplot of total counts per well is shown below. All treatments have reasonably similar total counts, although a small number of libraries have exceptionally low counts.
+```{r total boxplt, fig.cap="Boxplot of total counts per well for different chemicals"}
+aux = data.frame(Well = colnames(countData_matrix),
+                 Count = colSums2(countData_matrix)
+)
+aux$Chemical <- sapply(aux$Well,
+                       function(x) colData[x,"chemical"]
+)
+aux$Dose <- sapply(aux$Well,
+                   function(x) colData[x,"concentration"]
+)
+aux$Estrogen <- sapply(aux$Well, 
+                       function(x) colData[x,"estrogen"]
+)
+colnames(aux)[2] = "Total count"
+
+p <- ggplot(data = aux, aes(x=Chemical, y=`Total count`)) + 
+            geom_boxplot(aes(fill = Chemical)) +
+            theme(axis.text.x=element_blank()) +
+            ylab("Total read counts per well")
+p
+```
+
+There are several very low count wells, but at least these samples were treated with different chemicals/doses. We display the 10 wells with the lowest count organized by plate. We can see that there is a group of low counts in column 8 of plate PL2C that are likely due to pipette error (assuming multichannel pipette by column). This might impact BPA results at the at the 1 uM concentration point as biological replicate 2C has some low counts across multiple technical replicates at this concentration.
+
+```{r low read count wells table}
+tmp <- head(aux[order(aux$`Total count`), ], 
+            n=10
+)
+tmp[order(tmp$Well),]
+```
+
+
+## Set up dds object
+```{r dds object creation and collapsing technical replicates}
+dds <- DESeqDataSetFromMatrix(countData=countData_matrix,
+                              colData=colData,
+                              design=~ plate + chem_dose + estrogen + chem_dose:estrogen
+)
+featureData = data.frame(gene=rownames(countData_matrix))
+mcols(dds) = DataFrame(mcols(dds),
+                       featureData
+)
+
+## collapsing technical replicates- FYI- "rep" refers to biological replicate
+dds <- collapseReplicates(dds,
+                          dds$mega_var,
+                          renameCols=TRUE
+)
+dds_E2 = dds[,dds$estrogen == "stimulated"]
+dds_noE2 = dds[,dds$estrogen == "starved"]
+```
+
+## Check dispersion estimates
+Local fit performs better than the standard parametric fit by visual inspection.
+```{r dispersion estimate comparison, warning=FALSE, echo = FALSE}
+dds = estimateSizeFactors(dds)
+par(mfrow=c(1,2))
+dds <- estimateDispersions(dds, 
+                           fitType="parametric"
+)
+plotDispEsts(dds,
+             main="Plot of Dispersion Estimates \n Parametric Fit"
+)
+m_param = mcols(dds)
+med_residual_param = median(abs(log(m_param$dispGeneEst) - log(m_param$dispFit)), na.rm = TRUE)
+dds <- estimateDispersions(dds, 
+                           fitType="local"
+)
+m_local = mcols(dds)
+plotDispEsts(dds, main="Plot of Dispersion Estimates \n Local Fit")
+med_residual_local = median(abs(log(m_local$dispGeneEst) - log(m_local$dispFit)), na.rm = TRUE)
+```
+
+Confirmed by looking at the median absolute residual of each fit.
+
+```{r Median residuals of dispersion estimate fits}
+sprintf("Median residual of parametric fit: %f" ,
+        med_residual_param
+)
+sprintf("Median residual of local fit: %f" ,
+        med_residual_local
+)
+```
+
+Review of sparsity plot shows that for most genes counts are well-distributed over a number of samples across many levels of expression. 
+
+```{r check sparsity}
+plotSparsity(dds)
+```
+
+
+```{r check library size factors}
+hist(sizeFactors(dds),
+     xlim=c(0,3)
+)
+```
+
+
+```{r}
+characteristic.DF <- read.xls(xls='/Users/viktorian/Documents/SilentSpring/SilentSpring Data/characteristics_table.xlsx',
+                              sheet=2
+)
+characteristic.DF = data.frame(characteristic.DF[,0:19], 
+                               row.names='Gene.symbol'
+)
+```
+
+```{r}
+f <- function(x, counts) {
+ gene_name = x[1]
+ characteristic = x[4]
+ paste(gene_name,
+       characteristic, 
+       sep='\t'
+)
+}
+
+counts_norm <- counts(dds,
+                      normalized=TRUE
+)
+median_counts <- apply(counts_norm, 
+                       1,
+                       median
+)
+counts_median = data.frame(median_counts)
+counts_median$gene_pos = row.names(counts_median)
+counts_median$merge_criterion <- sapply(strsplit(row.names(counts_median),"_"), function(x) x[1])
+tmp <- merge(counts_median, characteristic.DF, 
+             by.x='merge_criterion', 
+             by.y='row.names'
+)
+row.names(tmp) = tmp$gene_pos
+tmp = tmp[,c("median_counts", "Characteristic")]
+#tmp2 = data.frame(aggregate(tmp$median_counts, by=list(category=tmp$Characteristic), summary), row.names='category')
+#tmp3 = data.frame(tmp2[,1])
+# tmp3$category = row.names(tmp2)
+p <- ggplot(data=tmp, aes(x=Characteristic, y=median_counts)) +
+            geom_boxplot(aes(fill = Characteristic)) +
+            theme(axis.text.x=element_blank()) +
+            ylab("Total read counts per well") +
+            ylim(0,7500)
+
+p
+```
+
+## PCA plots for QC and exploratory analysis
+In the PCA plot with all samples,  we see that most of the variance in the dataset can be explained by a principle component that separates estrogen-starved from estrogen-stimulated cells. We can also observe the inhibitory effect of Tamoxifen that causes estrogen stimulated samples to appear more similar to estrogen-starved control cells, similar to how estrogen-starved samples treated with BBP, BPA or Gen appear more similar to the estrogen-stimulated control cells. This is consistent with the known function of these chemicals. 
+
+The second principle component explains a much smaller amount of the variance within the dataset. No clear biological associations were noted.
+
+We've included two displays of the PCA. 
+```{r Plot PCA of all samples}
+idx = rowMeans(counts(dds, normalized=TRUE)) >= 5
+ddsFiltered = dds[idx,]
+vsd <- vst(ddsFiltered, blind = TRUE, nsub = nrow(ddsFiltered), fitType="local")
+pcaData <- plotPCA(vsd, intgroup=c("estrogen", "chemical"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+p1 <- ggplot(pcaData, aes(PC1, PC2, color = chemical, shape = estrogen)) + 
+             geom_point() + 
+             xlab(paste0("PC1: ", percentVar[1],"% variance")) + 
+             ylab(paste0("PC2: ", percentVar[2],"% variance")) + 
+             ggtitle("Silent Spring - All Samples from Pilot Experiment") +  
+             scale_color_brewer(type='qual', palette=3) + 
+             theme(legend.position = "right", legend.text=element_text(size=8)) +
+             guides(col=guide_legend(nrow=4))
+
+pcaData <- merge(x=pcaData, 
+                 y=as(colData(dds),'data.frame')[, c("concentration", "mega_var")], 
+                 by.x='row.names', 
+                 by.y='mega_var'
+)
+row.names(pcaData) = pcaData$Row.names
+pcaData$Row.names = NULL
+pcaData$name = NULL
+p2 <- ggplot(pcaData, aes(PC1, PC2, shape = estrogen, size = concentration, color = chemical)) +
+             geom_point() +
+             xlab(paste0("PC1: ", percentVar[1],"% variance")) + 
+             ylab(paste0("PC2: ", percentVar[2],"% variance")) +
+             ggtitle("Silent Spring - All Samples from Pilot Experiment") +
+             theme(legend.position="right", legend.text=element_text(size=8)) + 
+             guides(col=guide_legend(nrow=4))
+p1
+p2
+```
+
+We then made PCA plots of the estrogen-stimulated samples only. Again, samples grouped by estrogen treatment. 
+```{r}
+dds_E2 <- estimateSizeFactors(dds_E2)
+idx_E2treated <- rowMeans(counts(dds_E2, normalized=TRUE)) >= 5
+ddsFiltered_E2treated = dds_E2[idx_E2treated,]
+vsd_E2 <- vst(ddsFiltered_E2treated, blind = TRUE, nsub = nrow(ddsFiltered_E2treated), fitType="local")
+pcaData_E2treated <- plotPCA(vsd_E2, intgroup=c("chemical", "concentration"), returnData=TRUE)
+pcaData_E2treated$concentration <- as.factor(pcaData_E2treated$concentration)
+percentVar <- round(100 * attr(pcaData_E2treated, "percentVar"))
+ggplot(pcaData_E2treated, aes(PC1, PC2, color=chemical , shape=concentration)) + 
+       geom_point() + 
+       xlab(paste0("PC1: ", percentVar[1],"% variance")) +
+       ylab(paste0("PC2: ", percentVar[2],"% variance")) +
+       ggtitle("Silent Spring - Estrogen-stimulated Samples from Pilot Experiment") + 
+       scale_color_brewer(type='qual', palette=3) + 
+       theme(legend.position="right", legend.text=element_text(size=8)) +
+       guides(col=guide_legend(nrow=4))
+```
+
+The PCA Plot of Estrogen-starved samples is also dominated by the estrogen-mimicking effects of BPA, BBP, and Genistein.
+```{r}
+dds_noE2 <- estimateSizeFactors(dds_noE2)
+idx_E2untreated <- rowMeans(counts(dds_noE2, normalized=TRUE)) >= 5
+ddsFiltered_E2untreated = dds_noE2[idx_E2untreated,]
+vsd_noE2 <- vst(ddsFiltered_E2untreated,
+                blind = TRUE,
+                nsub = nrow(ddsFiltered_E2untreated),
+                fitType="local"
+)
+pcaData_E2untreated <- plotPCA(vsd_noE2,
+                               intgroup=c("chemical", "concentration"),
+                               returnData=TRUE
+)
+pcaData_E2untreated$concentration = as.factor(pcaData_E2untreated$concentration)
+percentVar <- round(100 * attr(pcaData_E2untreated, "percentVar"))
+ggplot(pcaData_E2untreated, aes(PC1, PC2, color=chemical , shape=concentration)) + 
+        geom_point() + 
+        xlab(paste0("PC1: ", percentVar[1],"% variance")) +
+        ylab(paste0("PC2: ", percentVar[2],"% variance")) +
+        ggtitle("Silent Spring - Estrogen-starved Samples from Pilot Experiment") + 
+        scale_color_brewer(type='qual', palette=3) + 
+        theme(legend.position = "right", legend.text=element_text(size=8)) +
+        guides(col=guide_legend(nrow=4))
+```
+
+
+## Heat maps for QC and exploratory analysis
+The complete set of counts is transformed using the variance stabilizing transformation from DESeq2. We then use these values to generate a heatmap and dendrogram of the samples. Again we see that the strongest separation is between the estrogen starved and stimulated samples.
+```{r exp all, warning=FALSE, echo = FALSE, fig.cap="Cluster heatmap of the entire dataset"}
+vst.data <- varianceStabilizingTransformation(dds, 
+                                              blind=TRUE, 
+                                              fitType="local"
+)
+
+### Visualize the sample distances (euclidian distance) in the heatmaps using pheatmap package
+sampleDistMatrix = as.matrix(dist(t(assay(vst.data))))
+colors <- colorRampPalette(rev(brewer.pal(9, "Spectral")))(255)
+
+# Data frame with column annotations.
+col_ann = data.frame(estrogen = colData(dds)$estrogen, 
+                     chemical = colData(dds)$chemical
+)
+rownames(col_ann) = colnames(sampleDistMatrix)
+
+# List with colors for each annotation.
+ann_colors <- list(estrogen=brewer.pal(2, "Set3"), 
+                   chemical=brewer.pal(9, "Set1")
+)
+names(ann_colors$estrogen) <- unique(colData(dds)$estrogen)
+names(ann_colors$chemical) <- unique(colData(dds)$chemical)
+ann_colors[[1]] = ann_colors$estrogen[-3]
+
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=dist(t(assay(vst.data))),
+         clustering_distance_cols=dist(t(assay(vst.data))),
+         show_colnames=FALSE,
+         show_rownames=FALSE,
+         annotation=col_ann,
+         annotation_colors=ann_colors,
+         col=colors
+)
+```
+
+
+After splitting the dataset on the ```estrogen``` variable we can again plot a similar heatmap showing only the estrogen-starved samples. BBP, BPA and genistein cluster together at all except the lowest dose. Tamoxifen samples also cluster together. No clear clusters are observed for the other chemicals.
+
+```{r exp separate0, echo = FALSE, fig.cap="Cluster heatmap of estrogen starved samples"}
+
+# Transform the data using variance stabilization trabsformation
+vst.data0 <- varianceStabilizingTransformation(dds_noE2,
+                                               blind=TRUE,
+                                               fitType="local")
+vst.data1 <- varianceStabilizingTransformation(dds_E2,
+                                               blind=TRUE, 
+                                               fitType="local")
+
+### Visualize the sample distances (euclidian distance) in the heatmaps using pheatmap package
+sampleDistMatrix0 = as.matrix(dist(t(assay(vst.data0))))
+sampleDistMatrix1 = as.matrix(dist(t(assay(vst.data1))))
+
+# Data frame with column annotations.
+col_ann0 = data.frame(chemical=colData(dds_noE2)$chemical,
+                      dose=factor(colData(dds_noE2)$concentration)
+)
+rownames(col_ann0) = colnames(sampleDistMatrix0)
+
+col_ann1 = data.frame(chemical=colData(dds_E2)$chemical,
+                      dose=factor(colData(dds_E2)$concentration)
+)
+rownames(col_ann1) = colnames(sampleDistMatrix1)
+
+# List with colors for each annotation.
+ann_colors <- list(chemical=brewer.pal(9, "Set1"), 
+                   dose=brewer.pal(5, "Set2")
+)
+names(ann_colors$chemical) = unique(colData(dds_noE2)$chemical)
+names(ann_colors$dose) = unique(colData(dds_noE2)$concentration)
+
+pheatmap(sampleDistMatrix0,
+         clustering_distance_rows=dist(t(assay(vst.data0))),
+         clustering_distance_cols=dist(t(assay(vst.data0))),
+         show_colnames=FALSE,
+         show_rownames=FALSE,
+         annotation=col_ann0,
+         annotation_colors=ann_colors,
+         col=colors
+)
+```
+
+
+
+
+The heatmap of estrogen-stimulated samples shows a cluster of Tamoxifen-treated samples at the higher doses.
+```{r exp separate1, echo = FALSE, fig.cap="Cluster heatmap of estrogen stimulated samples"}
+pheatmap(sampleDistMatrix1,
+         clustering_distance_rows=dist(t(assay(vst.data1))),
+         clustering_distance_cols=dist(t(assay(vst.data1))),
+         show_colnames=FALSE,
+         show_rownames=FALSE,
+         annotation=col_ann1,
+         annotation_colors=ann_colors,
+         col=colors
+)
+```
+
+## Differential Expression Analysis
+
+### Estrogen-stimulated versus estrogen-starved cells
+
+**```~ plate + chem_dose + estrogen + chem_dose:estrogen ```**
+
+The variables ```lane``` and ```plate``` are perfectly correlated, so we won't include ```lane``` in our design formula. The variable ```plate_assignment``` contains information about ```chemical``` (because there are only three levels of ```chemical``` for each ```plate assignment```. 
+
+We do not assume a linear relationship between ```concentration``` of a chemical and its impact on gene expression, so we combined the ```chemical``` and ```concentration``` factors into a combination ```chem_dose```. 
+
+We then verify that it is appropriate to include an interaction term between chem_dose and estrogen. By comparing the reduced model to the full model, we can use the Likelihood Ratio Test to show that our results are better explained by including an interaction term. 
+
+```{r}
+design(dds) <- ~ chem_dose + estrogen + estrogen:chem_dose
+dds <- DESeq(dds, fit='local')
+res_estrogen_starved_versus_stimulated <- results(dds,
+                                                  contrast=c("estrogen","starved","stimulated")
+)
+table(res_estrogen_starved_versus_stimulated$padj < 0.05)
+
+diff_expressed_genes_estrogen_starved_versus_stimulated <- rownames(res_estrogen_starved_versus_stimulated)[which(res_estrogen_starved_versus_stimulated$padj < 0.05)]
+
+```
+
+The distribution of p-values is what you would expect if the majority DE genes were true positives (i.e., not a uniform distribution)
+```{r low read count wells}
+hist(res_estrogen_starved_versus_stimulated$padj,
+     main="Histogram of p-values",
+     xlab="Adjusted p-values",
+     breaks=20
+)
+```
+
+ ### Individual chemicals impact on differential expression. 
+
+ Here we want to identify genes that are impacted by individual chemicals treatments across any dosage. We look only at estrogen-starved samples to isolate the effect of the chemical alone. We estimate dispersions on the estrogen-starved samples using a model that only includes `biological_replicate` and `chemical.` We then subset the data by chemical and use the likelihood-ratio test to determine effect of the chemical across all concentrations of treatment. 
+
+ We further subset the data by excluding the lower doses of chemicals to allow more sensitivity in detecting genes influence by the chemical. 
+
+
+```{r}
+chemicals = c("BBP", "BPA", "BQ", "Gen", "PFHxA", "PFNA", "PFOA", "Tam")
+doses = c("all", "without 0.001", "without 0.001 and 0.1")
+diff_expressed_genes_control_vs_chem_noE2 = list()
+chemicals_vs_control_E2_starved = data.frame(row.names = c("BBP vs Control", "BPA vs Control", "BQ vs Control", "Gen vs Control", "PFHxA vs Control", "PFNA vs Control", "PFOA vs Control", "Tam vs Control"))
+
+design(dds_noE2) <- ~ biological_replicate + chemical  
+dds_noE2 <- estimateDispersions(dds_noE2,
+                                fit='local'
+)
+
+for (j in 1:3){
+
+  column_values = c()
+  
+  for (i in 1:length(chemicals)){
+    
+    chem = chemicals[i]
+    
+    dds_custom = dds_noE2[, dds_noE2$chemical %in% c('control', chem)]
+
+    if (j == 1){
+      dds_custom$concentration = as.factor(dds_custom$concentration)  
+    } else if (j == 2){
+      dds_custom = dds_custom[, dds_custom$concentration != 0.001]
+      dds_custom$concentration = as.factor(dds_custom$concentration)
+    } else {
+      dds_custom = dds_custom[, !(dds_custom$concentration %in% c(0.001, 0.1))]
+      dds_custom$concentration = as.factor(dds_custom$concentration)
+    }
+    
+    dds_custom$estrogen = droplevels(dds_custom$estrogen)
+    dds_custom$chemical = factor(dds_custom$chemical)
+    
+    # testing for DE
+    dds_custom <- nbinomLRT(dds_custom, 
+                            full = ~ biological_replicate + chemical,
+                            reduced = ~ biological_replicate)
+    
+    res_control_vs_chem <- results(dds_custom)
+    
+    # getting result
+    number_of_diff_expressed_genes = sum(res_control_vs_chem$padj < 0.05,
+                                         na.rm=TRUE)
+    
+    diff_expressed_genes <- rownames(res_control_vs_chem)[which(res_control_vs_chem$padj <= 0.05)]
+    chem_intersect_len <- length(base::intersect(diff_expressed_genes, diff_expressed_genes_estrogen_starved_versus_stimulated))
+    percent <- round(((chem_intersect_len / number_of_diff_expressed_genes)*100), digits = 0)
+    column_value = paste(toString(number_of_diff_expressed_genes), 
+                         " (", toString(chem_intersect_len), " | ", toString(percent), "%)",
+                         sep = ""
+    )
+    column_values = c(column_values, column_value)
+    
+    if (j == 3){
+      diff_expressed_genes_control_vs_chem_noE2[[chem]] = diff_expressed_genes
+    }
+    
+  }
+  
+  chemicals_vs_control_E2_starved = data.frame(chemicals_vs_control_E2_starved, 
+                                               column_values
+  )
+}
+
+colnames(chemicals_vs_control_E2_starved) = c("All doses", "    Without 0.001", "    Without 0.001 and 0.1")
+print(chemicals_vs_control_E2_starved)
+
+
+```{r printing sporadically differentialy expressed genes,echo=F,warning=FALSE,error=FALSE,message=FALSE}
+print("Differentially expressed genes (without 0.001 and 0.1) ")
+for (chem in c("BQ", "PFHxA", "PFNA", "PFOA")){
+  if (length(diff_expressed_genes_control_vs_chem_noE2[[chem]]) > 0){
+    print(paste(chem, " vs control:", toString(diff_expressed_genes_control_vs_chem_noE2[[chem]])))
+  }
+}
+
+```
+
+Most of these genes appear to influence the same genes as estrogen treatment influences. 
+
+BQ, PFHxA PFNA and PFOA have little effect on differential expression at any dosage (and it is unclear to what extent these are true positives). Chemicals BBP, BPA, Gen and Tam impacted expression of a larger number of genes. Interestingly, Tamoxifen had an overall lower percentage of differentially expressed genes that were also differentially expressed under estrogen treatment. 
+
+
+
+ ### Intersection of differentially expressed genes induced by chemical
+
+ On this Venn diagram intersections of differentially expressed genes induced by estrogen and chemicals can be seen.
+
+
+```{r}
+diff_expressed_genes_control_vs_chem_noE2[["Estrogen_stimulated vs Estrogen_starved"]] = diff_expressed_genes_estrogen_starved_versus_stimulated
+names(diff_expressed_genes_control_vs_chem_noE2)[1:8] = c("BBP vs Control", "BPA vs Control", "BQ vs Control", "Gen vs Control", "PFHxA vs Control", "PFNA vs Control", "PFOA vs Control", "Tam vs Control")
+upset(fromList(diff_expressed_genes_control_vs_chem_noE2),
+      order.by = 'freq',
+      sets = c("BBP vs Control","BPA vs Control", "Gen vs Control", "Tam vs Control", "Estrogen_stimulated vs Estrogen_starved")
+)
+
+```
+
+ ### Individual chemical impact on differential expression (in the PRESENCE of estrogen)
+
+ Like in the previous setting when we saw inpact of chemicals without the presence of estrogen, here
+ we want to test impact of individual chemicals in the presence of estrogen. To do so, only estrogen
+ stimulated samples were kept and each chemicals is compared to control samples using different doses
+ like above. Code not shown in order to avoid redundancy.
+ 
+
+```{r}
+chemicals = c("BBP", "BPA", "BQ", "Gen", "PFHxA", "PFNA", "PFOA", "Tam")
+doses = c("all", "without 0.001", "without 0.001 and 0.1")
+diff_expressed_genes_control_vs_chem_E2 = list()
+
+chemicals_vs_control_E2_stimulated = data.frame(row.names = c("BBP vs Control", "BPA vs Control", "BQ vs Control", "Gen vs Control", "PFHxA vs Control", "PFNA vs Control", "PFOA vs Control", "Tam vs Control"))
+
+design(dds_E2) <- ~ biological_replicate + chemical  
+dds_E2 <- estimateDispersions(dds_E2, fit='local')
+
+for (j in 1:3){
+  
+  column_values = c()
+  
+  for (i in 1:length(chemicals)){
+    
+    chem = chemicals[i]
+    
+    dds_custom = dds_E2[, dds_E2$chemical %in% c('control', chem)]
+
+    if (j == 1){
+      dds_custom$concentration = as.factor(dds_custom$concentration)  
+    } else if (j == 2){
+      dds_custom = dds_custom[, dds_custom$concentration != 0.001]
+      dds_custom$concentration = as.factor(dds_custom$concentration)
+    } else {
+      dds_custom = dds_custom[, !(dds_custom$concentration %in% c(0.001, 0.1))]
+      dds_custom$concentration = as.factor(dds_custom$concentration)
+    }
+    
+    dds_custom$chemical = factor(dds_custom$chemical)
+    
+    # testing for DE
+    dds_custom <- nbinomLRT(dds_custom, 
+                            full = ~ biological_replicate + chemical,
+                            reduced = ~ biological_replicate)
+    
+    res_control_vs_chem <- results(dds_custom)
+    
+    # getting result
+    number_of_diff_expressed_genes = sum(res_control_vs_chem$padj < 0.05,
+                                         na.rm=TRUE)
+    
+    diff_expressed_genes = rownames(res_control_vs_chem)[which(res_control_vs_chem$padj <= 0.05)]
+    chem_intersect_len = length(base::intersect(diff_expressed_genes, diff_expressed_genes_estrogen_starved_versus_stimulated))
+    
+    percent <- round(((chem_intersect_len / number_of_diff_expressed_genes)*100),
+                     digits=0
+    )
+    column_value = paste(toString(number_of_diff_expressed_genes), " (", toString(chem_intersect_len), " | ", toString(percent), "%)", sep = "")
+    column_values = c(column_values, column_value)
+    
+    if (j == 3){
+      diff_expressed_genes_control_vs_chem_E2[[chem]] = diff_expressed_genes
+    }
+  }
+  
+  chemicals_vs_control_E2_stimulated = data.frame(chemicals_vs_control_E2_stimulated, column_values)
+}
+
+colnames(chemicals_vs_control_E2_stimulated) = c("All doses", "    Without 0.001", "    Without 0.001 and 0.1")
+print(chemicals_vs_control_E2_stimulated)
+
+```{r printing sporadically differentialy expressed genes no E2,echo=F,warning=FALSE,error=FALSE,message=FALSE}
+print("Differentially expressed genes (without 0.001 and 0.1) ")
+for (chem in c("BBP", "BPA", "BQ", "Gen", "PFHxA", "PFNA", "PFOA")){
+  if (length(diff_expressed_genes_control_vs_chem_E2[[chem]]) > 0){
+    print(paste(chem, " vs control:", toString(diff_expressed_genes_control_vs_chem_E2[[chem]])))
+  }
+}
+
+```
+
+ By looking at the effects of chemical treatment under estrogen-stimulated conditions, we can see that Tamoxifen is the only chemical with a large effect on differential expression of the assayed genes. This is consistent with the hypothesis that most of the effect of these chemicals is mediated via the same genes as the estrogen response.
+
+ ### Testing if there is any any impact induced by chemicals at a dosage level of 0.001 uM.
+
+ The first table testing the effect of chemicals in estrogen-starved cells showed that  excluding the lowest dose 0.001 uM have led to significantly higher signal in all 4 influential chemicals. That led us to hypothesize that 0.001 uM of these chemicals has no detectable impact on DE. We investigated the four chemicals showing the largest effects (i.e., BBP, BPA, Gen, Tam) have any detectable impact at the lowest expression level.
+
+```{r testing for impact of 0.001 dose,warning=FALSE,error=FALSE,message=FALSE}
+
+dds_custom = dds_noE2
+dds_custom = dds_custom[, dds_custom$chemical %in% c("control", "BBP", "BPA", "Gen", "Tam")]
+dds_custom = dds_custom[, dds_custom$concentration %in% c(0.001, 0)]
+
+dds_custom$estrogen = droplevels(dds_custom$estrogen)
+dds_custom$chemical = factor(dds_custom$chemical)
+design(dds_custom) <- ~biological_replicate + chemical
+dds_custom <-estimateSizeFactors(dds_custom)
+dds_custom <- estimateDispersions(dds_custom)
+dds_custom <- nbinomLRT(dds_custom, 
+                        full=~ biological_replicate + chemical,
+                        reduced=~ biological_replicate)
+
+res_control_vs_chemichals_at_0.001 <- results(dds_custom)
+
+diff_expressed_genes = rownames(res_control_vs_chemichals_at_0.001)[which(res_control_vs_chemichals_at_0.001$padj <= 0.05)]
+
+dose0.001_intersect_len = length(base::intersect(diff_expressed_genes, diff_expressed_genes_estrogen_starved_versus_stimulated))
+
+print(paste("Number of differentially expressed genes 'chemicals at 0.001 vs control' (intersection with estrogen driven diff expressed genes): ", toString(length(diff_expressed_genes)) , " (", length(chem_intersect_len), ")", ", these genes are: ", sep = ""))
+print(diff_expressed_genes)
+```
+
+ We see only 3 out of 557 genes are detectably diffferentially expressed at the lowest concentration, indicating that the lowest concentration of these chemicals has minimal to no detectable effect on gene expression.
+
+ ### Testing for chemical interactions with estrogen
+
+
+
+```{r}
+ddsLRT <- nbinomLRT(dds, 
+                    full = ~ biological_replicate + estrogen + chem_dose + chem_dose:estrogen,
+                    reduced = ~ biological_replicate + estrogen + chem_dose
+)
+resLRT <- results(ddsLRT)
+summary(resLRT)
+```
+
+ ## Wald Test for interactions
+
+ Set up functions and analysis design
+```{r}
+design(dds) <- ~ biological_replicate + estrogen + chem_dose + chem_dose:estrogen
+
+# this function will need to be changed when the model changes
+getResults <- function(ch_dose, est, int) {
+    contrast = integer(68) # change the total number here
+    if (ch_dose == "control") {
+        contrast[4] = 1 # and estrogen stimulated_vs_starved index here
+    } else {
+        ind <- grep(ch_dose, resultsNames(dds))
+        if (!int) contrast[ind[1]] = 1
+        if (est | int) contrast[ind[2]] = 1
+    }
+    # assign(paste0(ch_dose, "_Estrogen_", est), results(dds, contrast = contrast))
+    message(ch_dose, " - non-zero elements in contrast: ", 
+            paste(which(contrast==1), collapse = " "))
+    return(results(dds, contrast = contrast))
+}
+
+# added a single line to this function from the UpSetR package to keep 
+# the gene names in the output matrix
+fromList <- function(input){
+    elements <- unique(unlist(input))
+    data <- unlist(lapply(input, function(x){x = as.vector(match(elements, x))}))
+    data[is.na(data)] = as.integer(0); data[data != 0] = as.integer(1)
+    data = data.frame(matrix(data, 
+                             ncol=length(input), 
+                             byrow=FALSE)
+    )
+    data = data[which(rowSums(data) !=0), ]
+    names(data) = names(input)
+    rownames(data) = elements
+    return(data)
+}
+
+findDEG <- function(chem = NULL, dose = NULL, estrogen = 0, 
+                interaction = FALSE, alpha = 0.05) {
+    if (is.null(chem) & is.null(dose)) {
+        stop("You need to pass either chemical or dose!")
+    }
+    if (chem!="control" & !is.null(estrogen)) { # not if youre comparing controls - change!
+        if (!(estrogen %in% c(0,1))) stop("Estrogen parameter needs to be either 1 or 0!")
+    }
+    if (chem == "control" & !is.null(dose)) {
+        stop("You can only compare controls in the presence and absence of estrogen!")
+    }
+
+    if (!is.null(chem) & is.null(dose) & chem != "control") {
+        ch_dose <- paste0(chem, c("_0.001", "_0.1", "_1", "_10"))
+        results <- lapply(ch_dose, getResults, est = estrogen, int = interaction)
+        sigG <- lapply(results, function(x) rownames(x)[x$padj < alpha & !is.na(x$padj)])
+        if (interaction) {
+            names(sigG) <- paste0(ch_dose, "_estrogen_interaction")
+        } else names(sigG) <- paste0(ch_dose, "_es_control_at_E", estrogen)
+    } else if (chem == "control") {
+        results <- getResults("control") 
+        aux = rownames(results)[results$padj < alpha & !is.na(results$padj)]
+        sigG <- list("Estrogen_stimulated_Vs_Estrogen_starved" = aux)
+    }
+    # system("say Your differentialy expressed genes list is ready!")
+    return(sigG)
+}
+
+upsetPlot <- function(obj) {
+    if (sum(sapply(obj, length) > 0) > 1) {
+        upset(fromList(obj),
+              order = "freq"
+        )
+        } else message("At least two non-empty sets are needed for an upset plot. There is ", sum(sapply(obj, length) > 0), ".") 
+}
+```
+
+```{r}
+dds <- nbinomWaldTest(dds, 
+                      maxit=500
+)
+resultsNames(dds)
+```
+
+
+```{r}
+estrogen_stimulated_vs_starved <- findDEG(chem="control")
+```
+
+#### BBP/estrogen interaction
+
+```{r bbp estrogen int}
+BBP_Estrogen_int <- findDEG(chem="BBP",
+                            interaction=TRUE
+)
+BBP_Estrogen_int[["Estrogen_stimulated_versus_starved"]] <- estrogen_stimulated_vs_starved$Estrogen_stimulated_Vs_Estrogen_starved
+upsetPlot(BBP_Estrogen_int)
+```
+
+From the sizes of gene sets for which the interaction term is significant - we can conclude that there is some interaction between higher concentrations of this chemical and estrogen.
+
+#### BPA/estrogen interaction
+
+```{r bpa estrogen int}
+BPA_Estrogen_int <- findDEG(chem="BPA",
+                            interaction=TRUE
+)
+BPA_Estrogen_int[["Estrogen_stimulated_versus_starved"]] <- estrogen_stimulated_vs_starved$Estrogen_stimulated_Vs_Estrogen_starved
+upsetPlot(BPA_Estrogen_int)
+```
+
+The interaction term is significant for a large set of genes over different dosages of BPA!
+
+#### BQ/estrogen interaction
+
+```{r bq estrogen int}
+BQ_Estrogen_int <- findDEG(chem="BQ",
+                           interaction=TRUE
+)
+BQ_Estrogen_int[["Estrogen_stimulated_versus_starved"]] <- estrogen_stimulated_vs_starved$Estrogen_stimulated_Vs_Estrogen_starved
+upsetPlot(BQ_Estrogen_int)
+```
+
+Compared to BPA and BBP, Estrogen/BQ interaction is significant only in a small set of genes. Also, no significant genes at all for the highest concentration of BQ - could this all be noise?
+
+#### Gen/estrogen interaction
+
+```{r gen estrogen int}
+Gen_Estrogen_int <- findDEG(chem="Gen", 
+                            interaction=TRUE
+)
+Gen_Estrogen_int[["Estrogen_stimulated_versus_starved"]] <- estrogen_stimulated_vs_starved$Estrogen_stimulated_Vs_Estrogen_starved
+upsetPlot(Gen_Estrogen_int)
+```
+
+Large significant gene sets with the largest overlap.
+
+#### PFHxA/estrogen interaction
+
+```{r pfhxa estrogen int}
+PFHxA_Estrogen_int <- findDEG(chem="PFHxA", 
+                              interaction=TRUE
+)
+PFHxA_Estrogen_int[["Estrogen_stimulated_versus_starved"]] <- estrogen_stimulated_vs_starved$Estrogen_stimulated_Vs_Estrogen_starved
+upsetPlot(PFHxA_Estrogen_int)
+```
+
+There is no significant interaction for any gene at any dose.
+
+#### PFNA/estrogen interaction
+
+```{r pfna estrogen int}
+PFNA_Estrogen_int <- findDEG(chem="PFNA", 
+                             interaction=TRUE
+)
+PFNA_Estrogen_int[["Estrogen_stimulated_versus_starved"]] <- estrogen_stimulated_vs_starved$Estrogen_stimulated_Vs_Estrogen_starved
+upsetPlot(PFNA_Estrogen_int)
+```
+
+There is only a small number of genes for which the interaction is significant.
+
+#### PFOA/estrogen interaction
+
+```{r pfoa estrogen int}
+PFOA_Estrogen_int <- findDEG(chem="PFOA", 
+                             interaction=TRUE
+)
+PFOA_Estrogen_int[["Estrogen_stimulated_versus_starved"]] <- estrogen_stimulated_vs_starved$Estrogen_stimulated_Vs_Estrogen_starved
+upsetPlot(PFOA_Estrogen_int)
+```
+
+There is only a small number of genes for which this interaction is significant.
+
+#### Tam/estrogen interaction
+
+```{r tam estrogen int}
+Tam_Estrogen_int <- findDEG(chem="Tam", 
+                            interaction=TRUE
+)
+Tam_Estrogen_int[["Estrogen_stimulated_versus_starved"]] <- estrogen_stimulated_vs_starved$Estrogen_stimulated_Vs_Estrogen_starved
+upsetPlot(Tam_Estrogen_int)
+```
+
+There is a very large set of genes for which the interaction coefficient is significant, but only at the highest dose.
+
+
+```{r save de, echo=FALSE}
+# save(BBP_Vs_Control_at_E0, BBP_Vs_Control_at_E1, BPA_Vs_Control_at_E0,
+#     BPA_Vs_Control_at_E1, BQ_Vs_Control_at_E0, BQ_Vs_Control_at_E1,
+#     Gen_Vs_Control_at_E0, Gen_Vs_Control_at_E1, PFHxA_Vs_Control_at_E0, 
+#     PFHxA_Vs_Control_at_E1, PFNA_Vs_Control_at_E0, PFNA_Vs_Control_at_E1,
+#     PFOA_Vs_Control_at_E0, PFOA_Vs_Control_at_E1, Tam_Vs_Control_at_E0, 
+#     Tam_Vs_Control_at_E1, file="DEGS.RData")
+```
+
+
+## Gene set enrichment analysis
+###Estrogen stimulated Vs starved - controls only test
+
+ The lists of the differentially expressed genes, for various conditions, are usually not the end point of the analysis. 
+ The second part of the analysis focus on the interpretation, where we are looking for the patterns among the differentially expressed genes.
+ A lists of differentially expressed genes are easier to interpret if the genes exhibit similarity in their functionality. 
+ In this step analysis shifts from the level of single genes to sets of related genes, that are called pathways. 
+ Pathways are group of genes, which work together in order to process the signal and perform the certain function. 
+ Pathways are usually defined from libraries such as Gene Ontology (Ashburner et al., 2000) or KEGG (Ogata et al., 1999), which are based on previously accumulated knowledge.
+ Definition of the pathways are always given a priori and are constructed without reference to the data.
+
+```{r load enrichment libraries}
+# Load the packages 
+suppressPackageStartupMessages({
+source("https://bioconductor.org/biocLite.R")
+library('EnrichmentBrowser')
+library('biomaRt')
+library('huge')
+library('rags2ridges')
+})
+
+#Estrogen stimulated Vs starved - controls only test
+Estrogen_1vs0 <- findDEG(chem="control")
+
+
+# Get gene IDs for gene names from ensembl 
+human=useMart("ENSEMBL_MART_ENSEMBL",
+              dataset="hsapiens_gene_ensembl",
+              host="www.ensembl.org"
+)
+ann <- getBM(attribute=c("external_gene_name", "entrezgene"),
+             mart=human
+)
+colnames(ann) = c("GeneName", "gene_id")
+
+
+# Remove the numbers from the gene names
+genenames = rownames(countData_matrix)
+genenames <- strsplit(genenames, "_")
+symbols = integer(501)
+names(symbols) <- unique(sapply(genenames, function(x) x[1]))
+
+
+# Make object that indicate differentially expressed genes
+estDE <- sapply(strsplit(Estrogen_1vs0[[1]], "_"), "[", 1)
+for (gene in estDE) {
+  if (gene %in% names(symbols)) {
+    ind <- which(names(symbols) == gene)
+    symbols[ind] = 1
+  }
+}
+SSgen <- cbind(names(symbols),symbols)
+colnames(SSgen) = c("GeneName", "diffExp")
+
+
+# Make object with all, significant and none significant genes
+dat <- merge(ann,SSgen,by="GeneName")
+dat[,3] = as.numeric(as.character(dat[,3]))
+sigGen = dat[which(dat[,3] == 1),]
+noSigGen = dat[which(dat[,3] == 0),]
+```
+
+
+ We want to test whether known biological processes or pathways are enriched (over-represented) in the list of differentially expressed genes.
+ In the following analysis, we generate a table of pathways with the following features: pathway id, pathway name, number of the genes in the pathway, number of genes from the experiment in the pathway, number of significant genes, the p-value and adjusted p-value. 
+ Significance analysis test is performed using cross table and employing fisher exact test. Cross table compare number of non and significant genes versus number of genes in and outside the pathway.
+ Finally, due to the high-dimensionality of the data multiplicity correction is applied on the p-values across the genes.
+
+```{r}
+
+# For illustration what actually we tested cross table of breast cancer pathway is made:
+CrossTable <-
+  matrix(c(24, 8, 272, 198),
+         nrow = 2,
+         dimnames = list(c("Diff. Expressed", "Not Diff. Expressed"),
+                         c("In Breast Cancer Pathway", "Not Breast Cancer Pathway")))
+CrossTable
+
+# Function which generate pathway table
+pathwayTable <- function(db, 
+                         allG,
+                         sigG, 
+                         noSigG){
+  fin = data.frame(matrix(ncol=6, 
+                          nrow=length(db))
+  )
+  for(i in 1:length(db)){
+    if(length(intersect(as.numeric(db[[i]]),allG)) > 1) {
+      fin[i,1] <- sub("_.*", "", names(db[i]))
+      fin[i,2] <- gsub("_", " ", sub("^[^_]*", "", names(db[i])))
+      fin[i,3] <- length(db[[i]])
+      fin[i,4] <- length(intersect(as.numeric(db[[i]]),
+                                   allG)
+      )
+      fin[i,5] <- length(intersect(as.numeric(db[[i]]),
+                                   sigG)
+      )
+      CrossTab <- matrix(c(length(intersect(sigG,as.numeric(db[[i]]))), 
+                           length(intersect(noSigG,as.numeric(db[[i]]))),
+                           length(setdiff(sigG,as.numeric(db[[i]]))),
+                           length(setdiff(noSigG,as.numeric(db[[i]])))), 
+                         nrow=2)
+      fin[i,6] <- fisher.test(CrossTab, alternative = "greater")$p.value
+    }
+  }
+  
+  fin$X7 <- p.adjust(fin[,6],
+                     method ="fdr"
+  )
+  colnames(fin) <- c("PathwayID", "PathName", "PathSize", "OurGen",
+                     "NrSigGen", "Pval","adjPval")
+  
+  return(fin[order(fin[,7], 
+                   fin[,6], 
+                   decreasing=FALSE),]
+  )
+}
+```
+
+ For all human pathways, tables are generated from both KEGG and GO repositories. 
+
+## KEGG table
+```{r}
+# Top KEGG pathways table
+kegg.gs <- get.kegg.genesets("hsa")
+resKEGG <- pathwayTable(kegg.gs, 
+                        dat[,2], 
+                        sigGen[,2],
+                        noSigGen[,2]
+)
+head(resKEGG)
+```
+
+## Gene Ontology table
+```{r}
+# Top Gene Ontology pathways table
+go.gs <- get.go.genesets(org="hsa",
+                         onto="BP", 
+                         mode="GO.db"
+)
+resGO <- pathwayTable(go.gs,
+                      dat[,2], 
+                      sigGen[,2],
+                      noSigGen[,2]
+)
+head(resGO)
+```
+
+ We can also display top significant pathways as a barplot or a dotplot. 
+ Functions allow to generate these plots.  
+
+## Bar plot for top pathways
+ In the barplot, each bar includes all genes in particular pathways, while the colors represent different group of the data
+
+```{r}
+# Function for making bar and dot plot
+pathwayBarPlot <- function(finTab){
+  pathways <- rep(c(finTab[,2]),3)
+  allPathGen = finTab[,3]-finTab[,4]
+  noSigGen = finTab[,4]-finTab[,5]
+  sigGen = finTab[,5]
+  values = c(sigGen, noSigGen, allPathGen)
+  type = c(rep("Significant genes", nrow(finTab)), rep("No significant genes", nrow(finTab)), 
+            rep("All pathway genes", nrow(finTab)))
+  mydata <-data.frame(pathways, values)
+  mydata$pathways <-factor(mydata$pathways, 
+                           levels = c(finTab[,2]))
+  
+  p <-ggplot(mydata, aes(pathways, values))
+  p + geom_bar(stat="identity", aes(fill=type)) + 
+      coord_flip() + 
+      ggtitle("Dotplot of the pathways") +
+      ylab('Number of genes') +
+      xlab('Pathways') +
+      theme(axis.text=element_text(size=12),
+            axis.title=element_text(size=12, face="bold"),
+            title=element_text(size=12, face="bold")
+      )
+}
+```
+
+```{r, fig.width=11, fig.height=10}
+# Make a bar plot for top pathways
+pathwayBarPlot(resKEGG[1:20,])
+```
+
+## Dot plot for top pathways
+ The dotplot represents each significant pathway with a dot.
+ The dots are ordered based on the gene ratio between total number of genes in the pathway and number of genes measured in the experiment.
+ The size of the plot indicate number of number of significant genes, while the color shows the p-value of the pathway, before multiplicity correction.  
+
+```{r}
+pathwayDotPlot <- function(finTab){
+  df <- fortify(finTab,
+                showCategory=10,
+                split=split
+  )
+  df$GeneRatio = finTab$OurGen/finTab$PathSize
+  idx <- order(df$GeneRatio, 
+               decreasing=FALSE
+  )
+  df$PathName <- factor(df$PathName, 
+                        levels=unique(df$PathName[idx])
+  )
+  ggplot(df, aes_string(x="GeneRatio", y="PathName", size="NrSigGen", color="Pval")) +
+         geom_point() + 
+         scale_color_gradient(low="red", high="yellow") +
+         ylab('Pathways')  +
+         ggtitle("Dotplot of the pathways") + 
+         xlab('Gene ratio (experimnet vs. pathways)') +
+         theme(axis.text=element_text(size=12),
+               axis.title=element_text(size=12,face="bold"),
+               title=element_text(size=12,face="bold")
+          )
+}  
+```
+
+
+```{r, fig.width=11, fig.height=10}
+# Make a dot plot for top pathway. Note, this is displaying the p-value, NOT THE ADJUSTED p-value.
+pathwayDotPlot(resKEGG[1:20,])
+```
+
+
+ Based on the tables, we can conclude that there are no pathways enriched within the list of differentially expressed genes. However, the sparsity of the number of genes in each pathway likely accounts for this.  
+
+
+## Pathway analysis - gene network reconstruction
+
+ Although we have sparse pathways representation, we proceed with pathway analysis.
+ We can try to reconstruct interactions among assayed genes from breast cancer pathways.
+ Although we have only 32 genes from breast cancer pathways defined by KEGG, we can investigate how they interact among each other.
+ We aim to identify genes which are regulators. We use graphical modeling, which uses a ridge penalized ML estimator for precision matrix  to identify interactions among the genes.
+ Graphical modeling is based on p-dimensional Gaussian multivariate distribution, which we do not have in our data. 
+ In order to assume this distribution, we first transform our to a Gaussian distribution.
+
+```{r}
+
+# Reconstruction of the interaction among the genes from Breast cancer 
+
+datax <- counts(dds)
+rownames(datax) <- sapply(strsplit(rownames(datax), "_"),
+                          function(x) x[1]
+)
+
+datax <- aggregate(datax, 
+                   list(rownames(datax)),
+                   median
+)
+rownames(datax) = datax[,1]
+datax <- round(datax[,-1],0)
+
+kegg.gs <- get.kegg.genesets("hsa")
+PathGen <- dat[dat[,2]%in%as.numeric(kegg.gs$hsa05224),1]
+breastCancerDat <- datax[rownames(datax)%in%PathGen,]
+
+# Gaussianize data
+X.npn = huge.npn(t(breastCancerDat))
+Cx <- covML(X.npn)
+
+# Fit ridge penalized maximum likelihood model
+ridgeEst <- ridgeP(Cx, 
+                   lambda=1, 
+                   type="Alt"
+)
+
+# Sparsify the precision matrix, identifying only significant gene interactions.
+ridgeEst1 <- sparsify(ridgeEst,
+                      threshold="localFDR",
+                      FDRcut=0.9)
+
+```
+
+```{r}
+p <- abs(ridgeEst1[[2]])
+diag(p) = 0
+
+# Undirected graph for visulaization of sparsified precision matrix
+```
+
+```{r, fig.width=11, fig.height=10}
+Ugraph(p,
+       type="fancy", 
+       Vsize=20, 
+       Vcex=0.8, 
+       cut=0.07, 
+       main="Breast cancer pathway"
+)
+```
+
+ The plot illustrate the network of the gene interactions.Genes are represented by dots, while interactions with edges.
+ We can notice that there are few genes which can be considered as the regulators. 
+ However, we have to keep in mind that this is rather small part of the all genes. 
+
+## Enrichment analysis - based on gene characteristics
+
+Assayed genes are divided in 14 categories. We can further investigate how these categories are enriched for deferentially expressed genes.
+
+```{r}
+#  load characteristics table
+genChar <- read.xls ("characteristics_table.xlsx", 
+                     sheet=2, 
+                     header=TRUE)[,c(1,4)]
+genChar <- genChar[order((genChar[,1])),]
+genChar[,1] = as.character(genChar[,1])
+genChar[,2] = as.character(genChar[,2])
+```
+
+Due to the fact that there are inconsistency in gene names between characteristics_table and initial countData_matrix, I modify the gene names which seem to me that are the same.
+Thus if you consider that it might be that I modify the wrong names you can easily change.
+
+```{r}
+# Code which aim to correct gene names between two files
+for(i in 1:nrow(genChar)){
+  genChar[i,1] <- sub("\xa0", "", genChar[i,1])
+  genChar[i,1] <- gsub(" ", "", genChar[i,1], fixed = TRUE)
+  dat[i,1] <- toupper(dat[i,1])
+  if(genChar[i,1]=="RTEL1") genChar[i,1] = "RTEL1-TNFRSF6B"
+  if(genChar[i,1]=="TNFA") genChar[i,1] = "TNF"
+  if(genChar[i,1]=="UGT1A1") genChar[i,1] = "UGT1A"
+  if(genChar[i,1]=="THRA1") genChar[i,1] = "THRA"
+  if(genChar[i,1]=="SULT1A3") genChar[i,1] = "SULT1A4"
+  if(genChar[i,1]=="MRE11") genChar[i,1] = "MRE11A"
+  if(genChar[i,1]=="ORL1") genChar[i,1] = "OPRL1"
+}
+```
+
+ After the correction still there are genes with different names between names between two files.
+ In order to have look on this genes we following functions select them in both files.
+
+```{r}
+# Select all gene names which are in characteristics table but not in the count data matrix
+setdiff(as.character(genChar[,1]),
+        dat[,1]
+)
+```
+
+```{r}
+# Select all the genes which are in the count data matrix but not in the characteristics table 
+setdiff(dat[,1],
+        genChar[,1]
+)
+```
+
+```{r}
+# Merge two tables based on gene name
+tab <- merge(dat,
+             genChar,
+             by.x="GeneName", 
+             by.y="Gene.symbol"
+)
+
+# Make table for enrichemtn analysis of the chategories of the genes
+Char = c("mammary", "xeno", "apop", "OS", "growth", "immun", "hormone", "immort", 
+          "epigen", "cellcycle", "angio", "prolif", "genotox", "inflamm")
+fin <- data.frame(matrix(ncol = 4, 
+                         nrow = 14)
+)  
+for(i in 1:14){
+  tmp <- tab[which(tab[,4]==Char[i]),]
+  tmp1 <- tab[which(tab[,4]!=Char[i]),]
+  
+  fin[i,1] <- Char[i]
+  fin[i,2] <- nrow(tmp)
+  fin[i,3] <- nrow(tmp[which(tmp[,3]==1),])
+  CrossTab <- matrix(c(nrow(tmp[which(tmp[,3]==1),]), 
+                       nrow(tmp[which(tmp[,3]==0),]),
+                       nrow(tmp1[which(tmp1[,3]==1),]),
+                       nrow(tmp1[which(tmp1[,3]==0),])), nrow = 2)
+  fin[i,4] <- fisher.test(CrossTab, alternative = "greater")$p.value
+}
+fin$X5 <- p.adjust(fin[,4], method ="fdr")
+colnames(fin) = c("Characteristics", "CharactSize",
+                   "NrSigGen", "Pval","adjPval")
+fin <- fin[order(fin[,5], 
+                 fin[,4],
+                 decreasing=FALSE),]
+```
+
+Since our gene selection come from the 14 categories,  we can investigate whether these categories are enriched (over-represented) in the selection of the genes, which are considered to be differentially expressed.
+The code above generate table which indicate for all the categories following characteristics: characteristic name, number of the genes measured in the certain characteristics, number of significant genes from our selection, p-value and adjusted p-value.
+Significance analysis test is performed using cross table and employing fisher exact test. 
+Cross table compare number of non and significant genes versus number of genes in and outside the pathway. 
+Finally, due to the high-dimensionality of the data multiplicity correction is applied on the p-values across the genes.
+
+```{r}
+fin
+```
+
+```{r}
+# For illustration what actually we tested cross table of mammary genes is made:
+CrossTable <-
+  matrix(c(47, 23, 237, 168),
+         nrow = 2,
+         dimnames = list(c("Diff. Expressed", "Not Diff. Expressed"),
+                         c("Mammary genes", "Not mammary genes")))
+CrossTable
+```
+
+ For the illustration dotplot is plotted for each characteristics.
+ Dots are ordered based on the gene ratio between total number of genes in the characteristics and number of genes measured in the experiment.
+ Size of the plot indicate number of significant genes, while the color shows p-value of the pathway, after multiplicity correction.
+
+## Dot plot for all characteristics
+```{r}
+# Code for making dotplot
+df <- fortify(fin, 
+              showCategory=10, 
+              split=split
+)
+df$GeneRatio <- fin$CharactSize/sum(fin$CharactSize)
+idx <- order(df$GeneRatio, decreasing = FALSE)
+df$Characteristics <- factor(df$Characteristics, levels=unique(df$Characteristics[idx]))
+dotplot <- ggplot(df, aes_string(x="GeneRatio", y="Characteristics", size="NrSigGen", color="adjPval")) +
+                  geom_point() + 
+                  scale_color_gradient(low="red", high="yellow") + 
+                  ylab('Characteristics')  +
+                  ggtitle("Dotplot of the characteristics") +
+                  xlab('Gene ratio') +
+                  theme(axis.text=element_text(size=12),
+                        axis.title=element_text(size=12, face="bold"),
+                        title=element_text(size=12, face="bold")
+                  )
+```
+
+```{r, fig.width=11, fig.height=10}
+# Make a dotplot for all the characteristics
+dotplot
+```
+
+From the dotplot we can notice that the mammary characteristics has the highest number of genes, while the cellcycle lowest  and significant adjusted p-value.
+
+## Session info
+```{r}
+sessionInfo()
+```
+```
+
