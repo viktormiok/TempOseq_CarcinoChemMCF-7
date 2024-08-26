@@ -35,4 +35,4 @@ TempO-Seq data are analyzed using the Tempo-SeqR software package using the stat
 
 # License
 
-__`TempOseq_CarcinoChemMCF-7`__ is distributed under the GPL-3.0 License. Please read the license before using __`TempOseq_CarcinoChemMCF-7`__, which is distributed in the `LICENSE` file.
+__`TempOseq_CarcinoChemMCF-7`__ is distributed under the GPL-3.0 License. Please read the license before using __`TempOseq_CarcinoChemMCF-7`__, distributed in the `LICENSE` file.
