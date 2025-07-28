@@ -15,7 +15,7 @@ Targeted expression profiling identifies mechanisms of potential breast carcinog
   
 # Scope
 
-Differential gene expression and pathway analysis of MCF-7 cell lines exposed to multiple chemicals belonging to specific chemical classes at different doses under estrogen-starved and treated conditions employing breast cancer panel targeting 500 genes using TempO-Seq platform and a targeted gene expression panel, Breast Carcinogen Screen (BCScreen).
+Differential gene expression and pathway analysis of MCF-7 cell lines exposed to multiple chemicals belonging to specific chemical classes at varying doses under estrogen-starved and treated conditions, employing a breast cancer panel targeting 500 genes using the TempO-Seq platform and a targeted gene expression panel, Breast Carcinogen Screen (BCScreen).
 
 The study aims to identify mechanisms of potential breast carcinogens using targeted expression profiling, differential expression, and pathway analysis.
 
